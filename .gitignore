@@ -1,0 +1,20 @@
+# Models and large checkpoints
+models/
+
+# Outputs
+outputs/images/
+outputs/reports/
+
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# IDE config files
+.vscode/
+.idea/
+
+# OS specific files
+.DS_Store
+Thumbs.db

@@ -1,0 +1,17 @@
+{
+  "model_path": "models/safefolder/flux-schnell",
+  "vae_path": "models/safefolder/flux-schnell/vae",
+  "transformer_path": "models/safefolder/flux-schnell/transformer",
+  "text_encoder_path": "models/safefolder/flux-schnell/text_encoder",
+  "text_encoder_2_path": "models/safefolder/flux-schnell/text_encoder_2",
+  "tokenizer_path": "models/safefolder/flux-schnell/tokenizer",
+  "tokenizer_2_path": "models/safefolder/flux-schnell/tokenizer_2",
+  "scheduler_path": "models/safefolder/flux-schnell/scheduler",
+  "prompt": "A beautiful cinematic shot of a futuristic city with flying cars, high resolution",
+  "negative_prompt": "",
+  "num_inference_steps": 4,
+  "guidance_scale": 0.0,
+  "height": 1024,
+  "width": 1024,
+  "seed": 42
+}
