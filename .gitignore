@@ -1,5 +1,5 @@
 # Models and large checkpoints
-models/
+models/safefolder/
 
 # Outputs
 outputs/images/
