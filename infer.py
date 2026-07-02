@@ -4,67 +4,45 @@ import time
 import argparse
 import json
 from datetime import datetime
-from PIL import Image, ImageDraw
+from PIL import Image
 
 # Add project root to path for local imports
 project_root = os.path.dirname(os.path.abspath(__file__))
 if project_root not in sys.path:
     sys.path.append(project_root)
 
-from models.builder import build_flux_pipeline, build_qwen_pipeline
+# Set expandable segments to conserve CUDA memory allocations
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+# Apply diffusers library level patches before imports
+from utils.patches import patch_diffusers
+patch_diffusers()
+
+import torch
+from models.builder import build_flux_pipeline, run_qwen_image_workflow
 from utils.memory import free_memory, optimize_pipeline
 from utils.report import ReportGenerator
 
-def render_text_to_image(text, width=800, height=600):
-    """Renders text output onto a PIL Image for storage when output is textual."""
-    img = Image.new("RGB", (width, height), color=(20, 20, 25))
-    draw = ImageDraw.Draw(img)
-    
-    # Draw simple title
-    draw.text((20, 20), "QWEN MODEL RESPONSE:", fill=(0, 255, 128))
-    
-    # Draw response lines
-    y = 60
-    margin = 20
-    line_height = 20
-    
-    # Basic wrapping
-    words = text.split()
-    lines = []
-    current_line = ""
-    for word in words:
-        test_line = current_line + " " + word if current_line else word
-        # Simple length-based estimation instead of requiring custom fonts
-        if len(test_line) * 7 > (width - 2 * margin):
-            lines.append(current_line)
-            current_line = word
-        else:
-            current_line = test_line
-    if current_line:
-        lines.append(current_line)
-        
-    for line in lines:
-        if y > height - margin:
-            break
-        draw.text((margin, y), line, fill=(240, 240, 240))
-        y += line_height
-        
-    return img
-
 def main():
     parser = argparse.ArgumentParser(description="Inference Runner for FLUX and Qwen Models")
-    parser.add_argument("--model", type=str, choices=["flux", "qwen"], default="flux", help="Model to run")
-    parser.add_argument("--mode", type=str, choices=["text2img", "img2img", "vqa"], default="text2img", help="Inference mode")
+    parser.add_argument("--model", type=str, choices=["flux-schnell", "flux-klein", "qwen-image"], default="flux-schnell", help="Model to run")
+    parser.add_argument("--mode", type=str, choices=["text2img", "img2img"], default="text2img", help="Inference mode")
     parser.add_argument("--config", type=str, default=None, help="Override path to config json")
     parser.add_argument("--prompt", type=str, default=None, help="Override prompt for generation")
-    parser.add_argument("--image", type=str, default=None, help="Input image path (for img2img or VQA)")
+    parser.add_argument("--edit_prompt", type=str, default=None, help="Override edit prompt for generation")
+    parser.add_argument("--image", type=str, default=None, help="Input image path (for img2img)")
+    parser.add_argument("--steps", type=int, default=None, help="Override number of inference steps")
+    parser.add_argument("--seed", type=int, default=None, help="Override generation seed")
+    parser.add_argument("--model_path", type=str, default=None, help="Override path to local model weights (e.g. /kaggle/input/...)")
     args = parser.parse_args()
 
     # 1. Load Configurations
     if args.config:
         config_path = os.path.abspath(args.config)
     else:
-        config_filename = f"{args.model}_config.json"
+        # Determine default config file
+        config_prefix = "flux" if args.model.startswith("flux") else "qwen"
+        config_filename = f"{config_prefix}_config.json"
         config_path = os.path.join(project_root, "configs", config_filename)
 
     print(f"Loading configuration from: {config_path}")
@@ -75,101 +53,127 @@ def main():
     with open(config_path, "r", encoding="utf-8") as f:
         config = json.load(f)
 
-    # Apply command line overrides
+    # Merge command-line arguments to config
+    overridden = False
     if args.prompt:
         config["prompt"] = args.prompt
+        overridden = True
+    if args.edit_prompt:
+        config["edit_prompt"] = args.edit_prompt
+        overridden = True
     if args.image:
         config["image_path"] = args.image
+        overridden = True
+    if args.steps:
+        config["num_inference_steps"] = args.steps
+        overridden = True
+    if args.seed:
+        config["seed"] = args.seed
+        overridden = True
 
-    # 2. Build Pipeline
-    print(f"\nInitializing model pipeline: {args.model.upper()}...")
-    pipeline = None
-    try:
-        if args.model == "flux":
-            pipeline = build_flux_pipeline(config_path, mode=args.mode)
-        elif args.model == "qwen":
-            pipeline = build_qwen_pipeline(config_path)
-    except Exception as e:
-        print(f"Failed to build pipeline: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
+    if args.model_path:
+        config["model_path"] = args.model_path
 
-    # 3. Optimize memory
-    print("\nOptimizing VRAM utilization...")
-    optimize_pipeline(pipeline)
-    free_memory()
+    # Save overrides back to the config file if any occurred
+    if overridden:
+        try:
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(config, f, indent=2)
+            print(f"Saved updated overrides back to configuration file: {config_path}")
+        except Exception as e:
+            print(f"Warning: Could not save configuration updates back to file: {e}")
 
-    # 4. Run Inference
-    print(f"\nExecuting inference for {args.model.upper()}...")
-    start_time = time.time()
-    
-    output_image = None
+    # Resolve input image path and download if missing in img2img mode
     input_image_path = config.get("image_path")
-    
+    if input_image_path:
+        if not os.path.isabs(input_image_path):
+            input_image_path = os.path.abspath(os.path.join(project_root, input_image_path))
+        
+        # If it's img2img mode and the file doesn't exist, try downloading a default one
+        if args.mode == "img2img" and not os.path.exists(input_image_path):
+            print(f"Input image not found at: {input_image_path}")
+            print("Attempting to download default sample image from repository...")
+            try:
+                os.makedirs(os.path.dirname(input_image_path), exist_ok=True)
+                import urllib.request
+                default_url = "https://raw.githubusercontent.com/CompVis/stable-diffusion/main/assets/stable-samples/img2img/sketch-mountains-input.jpg"
+                urllib.request.urlretrieve(default_url, input_image_path)
+                print(f"Downloaded default image to {input_image_path}")
+            except Exception as e:
+                print(f"Failed to download default image: {e}")
+                sys.exit(1)
+
+    # 2. Run Inference Workflow
+    print(f"\nExecuting inference workflow for {args.model.upper()}...")
+    start_time = time.time()
+    output_image = None
+
     try:
-        if args.model == "flux":
-            import torch
-            generator = None
-            if "seed" in config and config["seed"] is not None:
-                generator = torch.Generator("cuda").manual_seed(config["seed"]) if torch.cuda.is_available() else torch.Generator().manual_seed(config["seed"])
+        if args.model.startswith("flux"):
+            # FLUX models (Schnell or Klein)
+            pipeline = build_flux_pipeline(config, mode=args.mode)
             
+            # Memory optimization for FLUX on single GPU
+            print("\nOptimizing VRAM utilization...")
+            optimize_pipeline(pipeline)
+            free_memory()
+
+            # Set generator seed
+            seed = config.get("seed", 42)
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            generator = torch.Generator(device).manual_seed(seed) if device == "cuda" else torch.Generator().manual_seed(seed)
+
+            # Execution
             if args.mode == "text2img":
-                from models.builder import run_flux_step_by_step
-                output_image = run_flux_step_by_step(
-                    pipeline=pipeline,
+                print("Running FLUX Text-to-Image Generation...")
+                output_image = pipeline(
                     prompt=config.get("prompt"),
-                    negative_prompt=config.get("negative_prompt", ""),
+                    height=config.get("height", 512),
+                    width=config.get("width", 512),
                     num_inference_steps=config.get("num_inference_steps", 4),
                     guidance_scale=config.get("guidance_scale", 0.0),
-                    height=config.get("height", 1024),
-                    width=config.get("width", 1024),
-                    seed=config.get("seed"),
-                    init_image=None,
-                    mode="text2img"
-                )
-                
+                    max_sequence_length=config.get("max_sequence_length", 128),
+                    generator=generator
+                ).images[0]
+            
             elif args.mode == "img2img":
-                print(f"Running Image-to-Image generation with input image: {input_image_path}")
+                print(f"Running FLUX Image-to-Image Generation with input: {input_image_path}")
                 if not input_image_path or not os.path.exists(input_image_path):
                     raise ValueError(f"Input image path is missing or invalid: {input_image_path}")
                 
                 init_image = Image.open(input_image_path).convert("RGB")
+                prompt_to_use = config.get("edit_prompt") or config.get("prompt")
                 
-                from models.builder import run_flux_step_by_step
-                output_image = run_flux_step_by_step(
-                    pipeline=pipeline,
-                    prompt=config.get("prompt"),
-                    negative_prompt=config.get("negative_prompt", ""),
+                output_image = pipeline(
+                    prompt=prompt_to_use,
+                    image=init_image.resize((config.get("width", 512), config.get("height", 512))),
+                    strength=config.get("strength", 0.85),
                     num_inference_steps=config.get("num_inference_steps", 4),
                     guidance_scale=config.get("guidance_scale", 0.0),
-                    height=config.get("height", 1024),
-                    width=config.get("width", 1024),
-                    seed=config.get("seed"),
-                    init_image=init_image,
-                    mode="img2img",
-                    strength=config.get("strength", 0.8)
-                )
-                
-        elif args.model == "qwen":
-            print("Running Visual Question Answering...")
-            response_text = pipeline(
-                prompt=config.get("prompt"),
-                image_path=input_image_path,
-                max_new_tokens=config.get("max_new_tokens", 512)
-            )
-            print(f"\nResponse: {response_text}\n")
-            output_image = render_text_to_image(response_text)
-            
+                    max_sequence_length=config.get("max_sequence_length", 128),
+                    generator=generator
+                ).images[0]
+
+        elif args.model == "qwen-image":
+            # Qwen-Image model (quantized text-offloaded workflow)
+            init_image = None
+            if args.mode == "img2img":
+                print(f"Loading input image for Qwen-Image Img2Img/Edit: {input_image_path}")
+                if not input_image_path or not os.path.exists(input_image_path):
+                    raise ValueError(f"Input image path is missing or invalid: {input_image_path}")
+                init_image = Image.open(input_image_path).convert("RGB")
+
+            output_image = run_qwen_image_workflow(config, mode=args.mode, init_image=init_image)
+
     except Exception as e:
-        print(f"Error during inference: {e}")
+        print(f"Error during inference execution: {e}")
         import traceback
         traceback.print_exc()
         sys.exit(1)
 
     end_time = time.time()
-    
-    # 5. Save output image
+
+    # 3. Save Output Image
     images_dir = os.path.join(project_root, "outputs", "images")
     os.makedirs(images_dir, exist_ok=True)
     
@@ -179,18 +183,21 @@ def main():
     
     if output_image:
         output_image.save(out_path)
-        print(f"Output saved to: {out_path}")
-    
-    # 6. Generate execution report
+        print(f"Output image saved successfully to: {out_path}")
+    else:
+        print("Warning: No output image was generated.")
+
+    # 4. Generate Execution Report
+    prompt_used = config.get("edit_prompt") if (args.mode == "img2img" and config.get("edit_prompt")) else config.get("prompt")
     ReportGenerator(
         start_time=start_time,
         end_time=end_time,
-        prompt=config.get("prompt"),
+        prompt=prompt_used,
         input_image=input_image_path,
         output_image=out_path
     )
-    
-    # 7. Final VRAM clean up
+
+    # 5. Final memory clean up
     print("\nPerforming final memory cleanup...")
     free_memory()
     print("Process complete.")

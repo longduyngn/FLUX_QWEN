@@ -1,10 +1,23 @@
 {
-  "model_path": "models/safefolder/qwen-image",
-  "prompt": "Describe this image in detail.",
-  "negative_prompt": "",
-  "num_inference_steps": 20,
-  "guidance_scale": 7.0,
+  "model_name": "qwen-image",
+  "repo_id": "diffusers/qwen-image-nf4",
+  "image_path": "outputs/images/input_image.png",
+  "prompt": "A realistic poster of a wooden cabin beside a quiet lake. The poster contains clear text: FLOW MATCHING. Morning mist, natural light.",
+  "negative_prompt": " ",
+  "edit_prompt": "Edit the image into a warm cinematic poster while preserving the same cabin and lake composition. Improve lighting, contrast, fine detail, and keep the text FLOW MATCHING readable.",
+  "num_inference_steps": 8,
+  "guidance_scale": 1.0,
+  "edit_num_inference_steps": 12,
+  "edit_guidance_scale": 3.0,
+  "max_sequence_length": 256,
   "height": 512,
   "width": 512,
-  "seed": 42
+  "seed": 42,
+  "edit_seed": 123,
+  "strength": 0.55,
+  "transformer_max_memory": {
+    "0": "14GiB",
+    "1": "14GiB"
+  },
+  "offload_dir": "./qwen_nf4_offload"
 }

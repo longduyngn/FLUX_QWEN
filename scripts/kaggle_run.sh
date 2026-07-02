@@ -1,29 +1,54 @@
 #!/bin/bash
 # Kaggle Setup and Run script for FLUX & Qwen Local Inference Pipeline
 
-echo "=== 1. Cloning Repository ==="
-git clone https://github.com/longduyngn/FLUX_QWEN.git
-cd FLUX_QWEN
+# 1. Clone Repository (if not inside it)
+if [ ! -d "configs" ]; then
+    echo "=== 1. Cloning Repository ==="
+    git clone https://github.com/longduyngn/FLUX_QWEN.git
+    cd FLUX_QWEN
+fi
 
 echo "=== 2. Installing Dependencies ==="
 pip install -r requirements.txt
 
-echo "=== 3. Hugging Face Login (For gated models) ==="
+# 3. Handle Hugging Face Token for Gated Models
 if [ -n "$1" ]; then
-    echo "Logging into Hugging Face Hub..."
+    export HF_TOKEN="$1"
     python -c "from huggingface_hub import login; login(token='$1')"
 elif [ -n "$HF_TOKEN" ]; then
-    echo "Logging into Hugging Face Hub using HF_TOKEN environment variable..."
     python -c "from huggingface_hub import login; login(token='$HF_TOKEN')"
-else
-    echo "No Hugging Face token provided. Skipping login."
-    echo "If FLUX download fails, run this script as: bash scripts/kaggle_run.sh <your_hf_token>"
 fi
 
-echo "=== 4. Downloading Model Weights ==="
-python scripts/download.py
+# 4. Search for pre-hosted Kaggle models
+FLUX_SCHNELL_PATH=""
+QWEN_PATH=""
 
-echo "=== 5. Running Inference (FLUX Text2Img) ==="
-python infer.py --model flux --mode text2img
+if [ -d "/kaggle/input" ]; then
+    echo "=== Searching for models in Kaggle input ==="
+    # Find directories matching the model patterns
+    FLUX_SCHNELL_PATH=$(find /kaggle/input -type d -name "*flux-schnell*" | head -n 1)
+    QWEN_PATH=$(find /kaggle/input -type d -name "*qwen-image-nf4*" | head -n 1)
+fi
+
+# 5. Run inference using hosted models (no downloader needed)
+if [ -n "$FLUX_SCHNELL_PATH" ]; then
+    echo "Found FLUX.1-schnell hosted at: $FLUX_SCHNELL_PATH"
+    echo "=== Running FLUX Inference (Hosted weights) ==="
+    python infer.py --model flux-schnell --mode text2img --model_path "$FLUX_SCHNELL_PATH"
+else
+    echo "FLUX.1-schnell not found in Kaggle inputs. Will download weights on the fly."
+    echo "=== Running FLUX Inference (On-demand download) ==="
+    python infer.py --model flux-schnell --mode text2img
+fi
+
+if [ -n "$QWEN_PATH" ]; then
+    echo "Found Qwen-Image hosted at: $QWEN_PATH"
+    echo "=== Running Qwen-Image Inference (Hosted weights) ==="
+    python infer.py --model qwen-image --mode text2img --model_path "$QWEN_PATH"
+else
+    echo "Qwen-Image not found in Kaggle inputs. Will download weights on the fly."
+    echo "=== Running Qwen-Image Inference (On-demand download) ==="
+    python infer.py --model qwen-image --mode text2img
+fi
 
 echo "=== Process Complete! Check outputs/images/ ==="
